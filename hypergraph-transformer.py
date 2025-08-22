@@ -3,12 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-# Kernel-Sparse Attention Layer (with PRF kernel approx + sparse correction)
-class KernelSparseAttentionLayer(nn.Module):
-    def __init__(self, d, r=64):
+# Hypergraph-Capable Transformer Layer (Modular, Reusable)
+class HypergraphTransformerLayer(nn.Module):
+    """
+    A single Transformer layer extended for hypergraphs.
+    - Embeds nodes and hyperedges as tokens.
+    - Applies self-attention with optional bipartite mask for efficiency.
+    - Can handle graphs (hyperedges of size 2) or hypergraphs (>2).
+    """
+    def __init__(self, d, use_mask=True):
         super().__init__()
         self.d = d
-        self.r = r  # Number of random features
+        self.use_mask = use_mask
         self.W_q = nn.Linear(d, d)
         self.W_k = nn.Linear(d, d)
         self.W_v = nn.Linear(d, d)
@@ -16,64 +22,39 @@ class KernelSparseAttentionLayer(nn.Module):
         self.ffn = nn.Sequential(nn.Linear(d, 4 * d), nn.ReLU(), nn.Linear(4 * d, d))
         self.norm1 = nn.LayerNorm(d)
         self.norm2 = nn.LayerNorm(d)
-        # Random projection matrix for PRF (fixed, as in Performer)
-        self.omega = nn.Parameter(torch.randn(d, r), requires_grad=False)
 
-    def forward(self, Z, mask=None):
+    def forward(self, Z, H=None, mask=None):
+        """
+        Z: Combined [node_emb + P_V; hyperedge_emb + P_E] ( (n+m) x d )
+        H: Incidence matrix (n x m); used to compute mask if not provided.
+        mask: Optional precomputed attention mask ((n+m) x (n+m)).
+        """
+        if self.use_mask and mask is None and H is not None:
+            n, m = H.shape
+            mask = torch.full((n + m, n + m), float('-inf'))
+            mask[:n, n:] = torch.where(H == 1, 0.0, float('-inf'))
+            mask[n:, :n] = torch.where(H.t() == 1, 0.0, float('-inf'))
+            mask.diagonal().fill_(0.0)
+
         Q = self.W_q(Z)
         K = self.W_k(Z)
         V = self.W_v(Z)
-        
-        # Normalize for unit norm (for angular LSH-like, but here for kernel)
-        Q_norm = Q / torch.norm(Q, dim=-1, keepdim=True).clamp(min=1e-6)
-        K_norm = K / torch.norm(K, dim=-1, keepdim=True).clamp(min=1e-6)
-        
-        # PRF: phi(x) = exp(omega^T x) / sqrt(r)  (for exp kernel approx)
-        phi_Q = torch.exp(torch.matmul(Q_norm, self.omega)) / (self.r ** 0.5)
-        phi_K = torch.exp(torch.matmul(K_norm, self.omega)) / (self.r ** 0.5)
-        
-        # Low-rank approx: phi_Q (phi_K^T V)
-        low_rank = torch.matmul(phi_Q, torch.matmul(phi_K.t(), V))
-        
-        # Sparse correction: On masked positions, compute exact exp(QK^T / sqrt(d)) - phi_Q phi_K^T
-        if mask is not None:
-            # Find positions where mask == 0 (attendable)
-            attendable = (mask == 0)
-            # Compute exact scores only on sparse positions
-            sparse_scores = torch.full_like(mask, 0.0)
-            sparse_scores[attendable] = torch.exp(
-                (Q.unsqueeze(1) * K.unsqueeze(0))[attendable] / (self.d ** 0.5)
-            ).sum(dim=-1) - (phi_Q.unsqueeze(1) * phi_K.unsqueeze(0))[attendable].sum(dim=-1)
-            
-            # Softmax approx on sparse + low-rank, but for simplicity, direct add delta
-            sparse_delta = torch.sparse.mm(
-                torch.sparse.FloatTensor(torch.nonzero(attendable).t(), sparse_scores[attendable], size=mask.shape),
-                V
-            )
-            attn_out = low_rank + sparse_delta
-        else:
-            attn_out = low_rank
-        
-        # Normalize (approximate row-wise softmax via diag inverse)
-        denom = torch.sum(attn_out, dim=-1, keepdim=True).clamp(min=1e-6)
-        attn_out = attn_out / denom
-        
+        attn_out = F.scaled_dot_product_attention(Q, K, V, attn_mask=mask, dropout_p=0.0)
         attn_out = self.W_o(attn_out)
         Z = self.norm1(Z + attn_out)
         ffn_out = self.ffn(Z)
         Z = self.norm2(Z + ffn_out)
         return Z
 
-# Hypergraph Transformer with Kernel-Sparse Attention
+# Full Hypergraph Transformer Model (Stackable Layers)
 class HypergraphTransformer(nn.Module):
-    def __init__(self, d, max_n, max_m, embedding, r=64):
+    def __init__(self, d, max_n, max_m, embedding, num_layers=3, use_mask=True):
         super().__init__()
         self.d = d
         self.embedding = embedding
         self.W_V = nn.Parameter(torch.randn(max_m, d))
         self.W_E = nn.Parameter(torch.randn(max_n, d))
-        self.layer1 = KernelSparseAttentionLayer(d, r)
-        self.layer2 = KernelSparseAttentionLayer(d, r)
+        self.layers = nn.ModuleList([HypergraphTransformerLayer(d, use_mask) for _ in range(num_layers)])
         self.mlp = nn.Linear(d, 1)
 
     def forward(self, token_ids, H, X_E):
@@ -84,36 +65,38 @@ class HypergraphTransformer(nn.Module):
         P_E = torch.matmul(H.t(), self.W_E[:n])
         Z = torch.cat((X_V + P_V, X_E + P_E), dim=0)
         
-        # Bipartite mask (float('-inf') where no attention)
-        mask = torch.full((n + m, n + m), float('-inf'))
-        mask[:n, n:] = torch.where(H == 1, 0.0, float('-inf'))
-        mask[n:, :n] = torch.where(H.t() == 1, 0.0, float('-inf'))
-        mask.diagonal().fill_(0.0)
+        # Precompute mask if using
+        mask = None
+        if self.layers[0].use_mask:
+            mask = torch.full((n + m, n + m), float('-inf'))
+            mask[:n, n:] = torch.where(H == 1, 0.0, float('-inf'))
+            mask[n:, :n] = torch.where(H.t() == 1, 0.0, float('-inf'))
+            mask.diagonal().fill_(0.0)
         
-        Z = self.layer1(Z, mask=mask)
-        Z = self.layer2(Z, mask=mask)
+        for layer in self.layers:
+            Z = layer(Z, H, mask)
+        
         node_out = Z[:n]
         pooled = node_out.mean(dim=0)
         pred = self.mlp(pooled)
         return pred
 
-# Basic Transformer (unchanged, for comparison)
+# Basic Transformer Model (For Comparison, Stackable Layers)
 class BasicTransformer(nn.Module):
-    def __init__(self, d, max_n, embedding):
+    def __init__(self, d, max_n, embedding, num_layers=3):
         super().__init__()
         self.d = d
         self.embedding = embedding
         self.pos = nn.Parameter(torch.randn(max_n, d))
-        self.layer1 = KernelSparseAttentionLayer(d)  # Can use kernel here too, but keep basic as full for contrast
-        self.layer2 = KernelSparseAttentionLayer(d)
+        self.layers = nn.ModuleList([HypergraphTransformerLayer(d, use_mask=False) for _ in range(num_layers)])
         self.mlp = nn.Linear(d, 1)
 
     def forward(self, token_ids):
         X_V = self.embedding(token_ids)
         n = X_V.shape[0]
         Z = X_V + self.pos[:n]
-        Z = self.layer1(Z)  # No mask for basic (full attention)
-        Z = self.layer2(Z)
+        for layer in self.layers:
+            Z = layer(Z)  # No mask for basic (full attention)
         pooled = Z.mean(dim=0)
         pred = self.mlp(pooled)
         return pred
@@ -161,19 +144,19 @@ tokenized_texts = [[word_to_ix[word] for word in text.split()] for text in texts
 
 # Hyperparameters
 d = 32
-r = 64  # Random features for kernel approx
-max_n = max(len(t) for t in tokenized_texts) + 5
-max_m = max_n
+max_n = max(len(t) for t in tokenized_texts) + 5  # Buffer
+max_m = max_n  # Approx
 lr = 0.001
 epochs = 200
 loss_fn = nn.BCEWithLogitsLoss()
+num_layers = 3  # Configurable for experiments
 
 # Shared embedding layer
 embedding = nn.Embedding(vocab_size, d)
 
 # Initialize models
-hg_model = HypergraphTransformer(d, max_n, max_m, embedding, r)
-basic_model = BasicTransformer(d, max_n, embedding)
+hg_model = HypergraphTransformer(d, max_n, max_m, embedding, num_layers=num_layers)
+basic_model = BasicTransformer(d, max_n, embedding, num_layers=num_layers)
 
 # Optimizers
 hg_optimizer = optim.Adam(hg_model.parameters(), lr=lr)
